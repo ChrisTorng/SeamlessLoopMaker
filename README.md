@@ -183,13 +183,13 @@ Because the head and tail are overlapped, even a no-source-trim result is shorte
 
 ## Current real-video test cases
 
-The preserve-first version was tested on three approximately 10-second, 24 fps AI background clips:
+The preserve-first version was tested using the default analysis and encoding settings on three approximately 10-second, 24 fps AI background clips:
 
-- Clip 1: no source frames trimmed; 0.75-second transition; about 9.29-second output.
-- Clip 2: initial no-trim render required post-encode retry; final result trimmed only 1 source frame and produced about 9.33 seconds.
-- Earlier test clip: only 5 source frames (about 0.21 seconds) needed trimming; final output about 9.08 seconds, compared with the older algorithm's 8.625-second result.
+- Clip 1: no source frames trimmed; 0.75-second transition; about 9.29-second output; encoded boundary ratio about 1.25.
+- Clip 2: no source frames trimmed; 0.625-second transition; about 9.50-second output; encoded boundary ratio about 1.43.
+- Earlier test clip: only 7 source frames (about 0.29 seconds) trimmed; 0.75-second transition; about 9.00-second output; encoded boundary ratio about 1.45. The older algorithm had shortened this same source to 8.625 seconds.
 
-The audio-preserving path was also verified after an automatic retry; video and AAC audio durations matched to within the codec timebase rounding interval.
+The audio-preserving path was also verified after automatic selection/retry; video and AAC audio durations matched to within the codec timebase rounding interval.
 
 ## License
 
