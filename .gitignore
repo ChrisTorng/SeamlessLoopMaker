@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*_loop.mp4
+*_preview_x*.mp4
+*_loop.json
