@@ -1,22 +1,35 @@
 # SeamlessLoopMaker
 
-Automatically turn a short video into a smoother seamless loop by searching for a better start/end frame pair, evaluating motion continuity, trimming weak sections, and rebuilding the loop seam with a controlled crossfade.
+Automatically turn a short video into a smoother seamless loop while preserving as much of the original clip as possible.
 
-This tool is intended especially for short AI-generated background animations such as waves, fire, fog, light particles, abstract motion, and projection backgrounds.
+The tool is intended especially for short AI-generated background animations such as waves, fire, fog, light particles, abstract motion, and projection backgrounds.
+
+## Key behavior
+
+The default strategy is **preserve-first** instead of aggressively searching for a shorter sub-clip:
+
+1. Keep the entire source span and try only a head/tail overlap transition.
+2. If that is not motion-balanced enough, trim the smallest possible number of source frames.
+3. Only if a small trim still cannot produce a good seam, use the broader SSIM + optical-flow fallback search.
+4. Render the result and verify the actual encoded loop boundary.
+5. If encoding makes the seam worse than expected, automatically retry once with stricter seam limits and keep the better result.
+
+This prevents a slightly higher analysis score from unnecessarily shortening an already-good 10-second AI animation.
 
 ## Features
 
-- Searches for a better loop start/end pair instead of assuming the original first and last frames are optimal.
-- Uses SSIM / structural similarity for frame appearance matching.
-- Uses Farneback optical flow to evaluate motion direction and velocity continuity near the loop boundary.
-- Penalizes candidates containing unusually slow or nearly static motion.
-- Simulates the loop transition and scores whether the transition motion is close to the normal frame-to-frame motion of the source video.
-- Prefers longer clips when multiple candidates have similar quality.
-- Rebuilds the seam with frame-accurate FFmpeg trimming and overlap dissolve.
+- Preserve-first selection: no source trim when the original span can already loop well.
+- Minimal-trim second stage: searches by total trim count and stops at the first acceptable level.
+- Automatic transition duration by default, testing several values from about 0.25 to 0.75 seconds.
+- Transition scoring based on frame-to-frame motion cadence rather than only static frame similarity.
+- SSIM and Farneback optical flow in the fallback search.
+- Low-motion / near-static section penalty in fallback search.
+- Post-encode verification with one automatic stricter retry when needed.
+- Frame-accurate FFmpeg trim and overlap dissolve.
 - Default output is muted.
-- Optional audio mode uses the same trim points and transition duration as the video, with audio crossfade instead of a hard cut.
-- Outputs a JSON analysis report.
-- Can generate a repeated preview file for visually checking the loop seam.
+- Optional synchronized audio crossfade using the same trim and transition positions as video.
+- JSON report with selection, verification, and retry attempts.
+- Optional repeated preview for visually checking the loop seam.
 
 ## Requirements
 
@@ -24,7 +37,7 @@ This tool is intended especially for short AI-generated background animations su
 - Python 3.11+
 - FFmpeg / FFprobe available in `PATH`
 
-Verify FFmpeg first:
+Verify FFmpeg:
 
 ```powershell
 ffmpeg -version
@@ -53,10 +66,13 @@ input_loop.json
 Default behavior:
 
 - Audio: muted
-- Transition: 0.50 seconds
-- Candidate duration: 75% to 98% of the source video
+- Transition: `auto`
+- Small-trim budget: up to 8% of source frames before fallback search
+- Fallback duration range: 75% to 98% of source
 - Video codec: H.264
 - CRF: 18
+
+`auto` tries several transition lengths and selects the best motion-balanced candidate while preserving the source span first.
 
 ## Keep audio with synchronized crossfade
 
@@ -64,7 +80,7 @@ Default behavior:
 py seamless_loop.py input.mp4 output.mp4 --audio crossfade
 ```
 
-The audio uses the same loop start/end positions and overlap duration as the video. The seam is rebuilt with an audio fade/mix rather than a direct cut.
+The audio uses the same selected source range and overlap duration as the video. The loop seam is rebuilt with fades and mixing rather than a hard audio cut.
 
 ## Generate a repeated seam-check preview
 
@@ -78,41 +94,66 @@ This also creates:
 output_preview_x3.mp4
 ```
 
-A repeated preview is useful because the loop boundary becomes much easier to judge when it occurs several times in succession.
+A repeated preview makes the loop boundary much easier to judge because it occurs several times in succession.
 
-## Common adjustments
-
-Keep more of the original duration:
+## Force a specific transition length
 
 ```powershell
-py seamless_loop.py input.mp4 --min-duration-ratio 0.85 --max-duration-ratio 0.99
+py seamless_loop.py input.mp4 --transition 0.5
 ```
 
-Use a shorter transition:
-
-```powershell
-py seamless_loop.py input.mp4 --transition 0.375
-```
-
-Use a softer, longer transition:
+Or:
 
 ```powershell
 py seamless_loop.py input.mp4 --transition 0.75
 ```
 
-For complex motion, a longer transition can reduce an abrupt seam, but a transition that is too long may create visible double-image blending. Around 0.3 to 0.75 seconds is usually a useful range for short animated backgrounds.
+The default `auto` mode is normally preferred.
+
+## Preserve-first tuning
+
+Allow at most 5% source trimming before fallback:
+
+```powershell
+py seamless_loop.py input.mp4 --small-trim-ratio 0.05
+```
+
+The broad fallback duration controls apply only when full-span and minimal-trim strategies cannot produce an acceptable seam:
+
+```powershell
+py seamless_loop.py input.mp4 --min-duration-ratio 0.85 --max-duration-ratio 0.99
+```
+
+## Post-encode verification
+
+The source-frame simulation is not treated as final truth. The rendered MP4 is decoded again and the actual loop boundary is compared with normal internal frame-to-frame motion.
+
+If the encoded boundary falls outside the default verification range, SeamlessLoopMaker performs one stricter re-selection and render, then keeps the better result.
+
+The relevant advanced options are:
+
+```text
+--verify-min-ratio
+--verify-max-ratio
+--retry-seam-min-ratio
+--retry-seam-max-ratio
+```
+
+Normally these should be left at their defaults.
 
 ## JSON report
 
 Every run produces a JSON report containing information such as:
 
-- Selected start/end frame
-- Transition frame count
-- SSIM
-- Optical-flow similarity
-- Transition motion naturalness
-- Estimated and actual output duration
-- Loop-boundary frame-difference ratio relative to normal internal frame differences
+- selection mode: `preserve`, `small-trim`, or `fallback`
+- selected start/end frame
+- transition frame count and seconds
+- source-span retention ratio
+- transition motion naturalness
+- predicted loop-boundary motion ratio
+- actual encoded loop-boundary verification ratio
+- render attempts when a stricter retry was needed
+- SSIM / optical-flow data when fallback search is used
 
 Specify a custom report path with:
 
@@ -122,19 +163,33 @@ py seamless_loop.py input.mp4 --report result.json
 
 ## Algorithm overview
 
-1. Decode the video frame by frame at reduced resolution for analysis.
-2. Calculate Farneback optical flow and build block-based motion descriptors for adjacent frames.
-3. Quickly shortlist candidate `(start, end)` pairs using visual correlation, optical-flow similarity, motion level, and duration constraints.
-4. Calculate SSIM for shortlisted candidates.
-5. Simulate the overlap dissolve and compare transition frame-to-frame motion with the source video's normal motion cadence.
-6. Score the candidates and select the best continuous region.
-7. Use FFmpeg for frame-accurate trimming and rebuild the loop seam with overlap dissolve.
-8. If `--audio crossfade` is enabled, use the same start/end/transition values for `atrim`, fades, and audio mixing.
-9. Re-read the result and write verification metrics into the JSON report.
+### Stage 1: preserve
 
-## Example test result
+The complete source span is tested with several circular overlap transitions. The tool compares transition frame differences with the median internal motion of the source and prefers a loop seam whose motion is neither an abrupt jump nor an obvious slowdown.
 
-The initial implementation was verified using an actual 10.04-second, 24 fps, 241-frame source clip. The selected result was 8.625 seconds with a 12-frame / 0.5-second loop transition. The tool also verified an audio-preserving version where both video and audio durations were exactly 8.625 seconds.
+### Stage 2: minimal trim
+
+If the complete source span is not acceptable, the tool tries total trim counts in ascending order: 1 frame, 2 frames, 3 frames, and so on. It stops as soon as that trim level contains an acceptable candidate. This makes duration preservation a decision rule, not merely a low-weight scoring preference.
+
+### Stage 3: fallback search
+
+Only when the first two stages fail, the tool performs the broader candidate search using visual correlation, SSIM, Farneback optical flow, boundary motion level, low-motion penalties, and duration scoring.
+
+### Rendering
+
+FFmpeg performs frame-accurate trim, separates the head/middle/tail, overlaps the tail and head with a dissolve, then concatenates the middle and blended transition into the final loop.
+
+Because the head and tail are overlapped, even a no-source-trim result is shorter than the source by approximately the selected transition duration. This is overlap time, not discarded source content.
+
+## Current real-video test cases
+
+The preserve-first version was tested on three approximately 10-second, 24 fps AI background clips:
+
+- Clip 1: no source frames trimmed; 0.75-second transition; about 9.29-second output.
+- Clip 2: initial no-trim render required post-encode retry; final result trimmed only 1 source frame and produced about 9.33 seconds.
+- Earlier test clip: only 5 source frames (about 0.21 seconds) needed trimming; final output about 9.08 seconds, compared with the older algorithm's 8.625-second result.
+
+The audio-preserving path was also verified after an automatic retry; video and AAC audio durations matched to within the codec timebase rounding interval.
 
 ## License
 
