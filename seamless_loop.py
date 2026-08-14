@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import argparse, heapq, json, math, shutil, subprocess, sys
+import argparse
+import copy
+import heapq
+import json
+import math
+import shutil
+import subprocess
+import sys
 from fractions import Fraction
 from pathlib import Path
 
 import cv2
 import numpy as np
+
+AUTO_TRANSITIONS = (0.25, 1 / 3, 0.375, 0.50, 0.625, 0.75)
 
 
 def run(cmd):
@@ -17,18 +26,18 @@ def probe(path, ffprobe):
     p = run([ffprobe, "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path)])
     if p.returncode:
         raise RuntimeError(p.stderr)
-    d = json.loads(p.stdout)
-    v = next((x for x in d["streams"] if x.get("codec_type") == "video"), None)
-    if not v:
+    data = json.loads(p.stdout)
+    video = next((x for x in data["streams"] if x.get("codec_type") == "video"), None)
+    if not video:
         raise RuntimeError("Input has no video stream")
-    rate = v.get("avg_frame_rate") or v.get("r_frame_rate") or "0/0"
+    rate = video.get("avg_frame_rate") or video.get("r_frame_rate") or "0/0"
     fps = float(Fraction(rate)) if rate != "0/0" else 0.0
     return {
         "fps": fps,
-        "width": int(v.get("width", 0)),
-        "height": int(v.get("height", 0)),
-        "duration": float(v.get("duration") or d.get("format", {}).get("duration") or 0),
-        "has_audio": any(x.get("codec_type") == "audio" for x in d["streams"]),
+        "width": int(video.get("width", 0)),
+        "height": int(video.get("height", 0)),
+        "duration": float(video.get("duration") or data.get("format", {}).get("duration") or 0),
+        "has_audio": any(x.get("codec_type") == "audio" for x in data["streams"]),
     }
 
 
@@ -39,13 +48,13 @@ def read_frames(path, width):
     fps = float(cap.get(cv2.CAP_PROP_FPS) or 0)
     out = []
     while True:
-        ok, f = cap.read()
+        ok, frame = cap.read()
         if not ok:
             break
-        h, w = f.shape[:2]
+        h, w = frame.shape[:2]
         if w > width:
-            f = cv2.resize(f, (width, max(2, round(h * width / w))), interpolation=cv2.INTER_AREA)
-        out.append(cv2.cvtColor(f, cv2.COLOR_BGR2GRAY))
+            frame = cv2.resize(frame, (width, max(2, round(h * width / w))), interpolation=cv2.INTER_AREA)
+        out.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
     cap.release()
     if len(out) < 12:
         raise RuntimeError("Video is too short")
@@ -56,163 +65,451 @@ def ssim(a, b):
     a, b = a.astype(np.float32), b.astype(np.float32)
     c1, c2 = (2.55 ** 2), (7.65 ** 2)
     ma, mb = cv2.GaussianBlur(a, (11, 11), 1.5), cv2.GaussianBlur(b, (11, 11), 1.5)
-    va = cv2.GaussianBlur(a*a, (11, 11), 1.5) - ma*ma
-    vb = cv2.GaussianBlur(b*b, (11, 11), 1.5) - mb*mb
-    vab = cv2.GaussianBlur(a*b, (11, 11), 1.5) - ma*mb
-    return float(np.mean(((2*ma*mb+c1)*(2*vab+c2))/((ma*ma+mb*mb+c1)*(va+vb+c2)+1e-12)))
+    va = cv2.GaussianBlur(a * a, (11, 11), 1.5) - ma * ma
+    vb = cv2.GaussianBlur(b * b, (11, 11), 1.5) - mb * mb
+    vab = cv2.GaussianBlur(a * b, (11, 11), 1.5) - ma * mb
+    return float(np.mean(((2 * ma * mb + c1) * (2 * vab + c2)) / ((ma * ma + mb * mb + c1) * (va + vb + c2) + 1e-12)))
+
+
+def base_frame_diffs(frames):
+    arr = frames.astype(np.float32) / 255
+    return np.mean(np.abs(arr[1:] - arr[:-1]), axis=(1, 2))
+
+
+def simulate_transition(frames, frame_diffs, s, e, k):
+    clip = frames[s:e].astype(np.float32) / 255
+    if len(clip) <= 2 * k + 4:
+        return None
+
+    head, tail = clip[:k], clip[-k:]
+    alpha = np.linspace(0, 1, k, dtype=np.float32)[:, None, None]
+    blend = (1 - alpha) * tail + alpha * head
+
+    baseline = float(np.median(frame_diffs[s:e - 1])) + 1e-9
+    transition_diffs = [float(np.mean(np.abs(clip[-k - 1] - blend[0])))]
+    transition_diffs += np.mean(np.abs(blend[1:] - blend[:-1]), axis=(1, 2)).tolist()
+    transition_diffs += [float(np.mean(np.abs(blend[-1] - clip[k])))]
+    ratios = np.asarray(transition_diffs, dtype=np.float32) / baseline
+
+    boundary_ratio = transition_diffs[-1] / baseline
+    naturalness = math.exp(-float(np.mean(np.abs(np.log(np.clip(ratios, 1e-4, None))))))
+    seam_balance = math.exp(-abs(math.log(max(boundary_ratio, 1e-4))))
+
+    return {
+        "boundary_ratio": float(boundary_ratio),
+        "transition_naturalness": float(naturalness),
+        "transition_min_ratio": float(ratios.min()),
+        "transition_max_ratio": float(ratios.max()),
+        "seam_balance": float(seam_balance),
+    }
+
+
+def parse_transition_choices(value, fps):
+    if value == "auto":
+        seconds = AUTO_TRANSITIONS
+    else:
+        try:
+            seconds = (float(value),)
+        except ValueError as ex:
+            raise ValueError("--transition must be 'auto' or a number of seconds") from ex
+        if not 0.08 <= seconds[0] <= 2.0:
+            raise ValueError("--transition seconds must be between 0.08 and 2.0")
+
+    seen = set()
+    choices = []
+    for sec in seconds:
+        frames = max(2, round(sec * fps))
+        if frames not in seen:
+            seen.add(frames)
+            choices.append((frames, frames / fps))
+    return choices
+
+
+def acceptable(metrics, args):
+    return (
+        args.seam_min_ratio <= metrics["boundary_ratio"] <= args.seam_max_ratio
+        and metrics["transition_naturalness"] >= args.min_transition_naturalness
+    )
+
+
+def preserve_quality(metrics, source_span_ratio, output_ratio):
+    return (
+        0.46 * metrics["seam_balance"]
+        + 0.34 * metrics["transition_naturalness"]
+        + 0.12 * source_span_ratio
+        + 0.08 * output_ratio
+    )
+
+
+def candidate(frames, frame_diffs, fps, s, e, k, mode):
+    metrics = simulate_transition(frames, frame_diffs, s, e, k)
+    if metrics is None:
+        return None
+    n = len(frames)
+    source_span_ratio = (e - s) / n
+    output_frames = e - s - k
+    output_ratio = output_frames / n
+    result = {
+        "mode": mode,
+        "start_frame": int(s),
+        "end_frame": int(e),
+        "transition_frames": int(k),
+        "transition_seconds": float(k / fps),
+        "source_span_ratio": float(source_span_ratio),
+        "output_duration": float(output_frames / fps),
+        **metrics,
+    }
+    result["score"] = preserve_quality(metrics, source_span_ratio, output_ratio)
+    return result
+
+
+def choose_preserve_first(frames, fps, transition_choices, args):
+    n = len(frames)
+    frame_diffs = base_frame_diffs(frames)
+
+    full = []
+    for k, _ in transition_choices:
+        x = candidate(frames, frame_diffs, fps, 0, n, k, "preserve")
+        if x:
+            full.append(x)
+    accepted = [x for x in full if acceptable(x, args)]
+    if accepted:
+        return max(accepted, key=lambda x: x["score"]), sorted(full, key=lambda x: x["score"], reverse=True)
+
+    max_total_trim = max(1, round(n * args.small_trim_ratio))
+    small_all = list(full)
+    for total_trim in range(1, max_total_trim + 1):
+        level = []
+        for start_trim in range(total_trim + 1):
+            end_trim = total_trim - start_trim
+            s, e = start_trim, n - end_trim
+            for k, _ in transition_choices:
+                x = candidate(frames, frame_diffs, fps, s, e, k, "small-trim")
+                if x:
+                    level.append(x)
+                    small_all.append(x)
+        accepted = [x for x in level if acceptable(x, args)]
+        if accepted:
+            return max(accepted, key=lambda x: x["score"]), sorted(small_all, key=lambda x: x["score"], reverse=True)[:20]
+
+    fallback = choose_fallback(frames, fps, transition_choices, args)
+    return fallback, sorted(small_all + [fallback], key=lambda x: x["score"], reverse=True)[:20]
 
 
 def flow_desc(flow, gx=8, gy=4):
     h, w = flow.shape[:2]
-    a = []
+    values = []
     for y in range(gy):
         for x in range(gx):
-            c = flow[y*h//gy:(y+1)*h//gy, x*w//gx:(x+1)*w//gx]
-            m = np.linalg.norm(c, axis=2)
-            a += [c[...,0].mean(), c[...,1].mean(), m.mean()]
-    a = np.asarray(a, np.float32)
-    return a / (np.linalg.norm(a) + 1e-8)
+            cell = flow[y * h // gy:(y + 1) * h // gy, x * w // gx:(x + 1) * w // gx]
+            mag = np.linalg.norm(cell, axis=2)
+            values += [cell[..., 0].mean(), cell[..., 1].mean(), mag.mean()]
+    values = np.asarray(values, np.float32)
+    return values / (np.linalg.norm(values) + 1e-8)
 
 
-def features(frames):
+def fallback_features(frames):
     h, w = frames.shape[1:]
-    fw, fh = min(160, w), max(2, round(h * min(160, w) / w))
+    fw = min(160, w)
+    fh = max(2, round(h * fw / w))
     small = np.stack([cv2.resize(f, (fw, fh), interpolation=cv2.INTER_AREA) for f in frames])
     desc, mag = [], []
-    for i in range(len(small)-1):
-        fl = cv2.calcOpticalFlowFarneback(small[i], small[i+1], None, .5, 3, 15, 3, 5, 1.2, 0)
-        desc.append(flow_desc(fl)); mag.append(np.linalg.norm(fl, axis=2).mean())
-    arr = frames.astype(np.float32)/255
-    mad = np.mean(np.abs(arr[1:]-arr[:-1]), axis=(1,2))
-    tiny = np.stack([cv2.resize(f, (80,44), interpolation=cv2.INTER_AREA) for f in frames]).astype(np.float32)/255
+    for i in range(len(small) - 1):
+        flow = cv2.calcOpticalFlowFarneback(small[i], small[i + 1], None, .5, 3, 15, 3, 5, 1.2, 0)
+        desc.append(flow_desc(flow))
+        mag.append(np.linalg.norm(flow, axis=2).mean())
+
+    tiny = np.stack([cv2.resize(f, (80, 44), interpolation=cv2.INTER_AREA) for f in frames]).astype(np.float32) / 255
     z = tiny.reshape(len(tiny), -1)
-    z = (z-z.mean(1,keepdims=True))/(z.std(1,keepdims=True)+1e-6)/math.sqrt(z.shape[1])
-    return np.stack(desc), np.asarray(mag), mad, z
+    z = (z - z.mean(1, keepdims=True)) / (z.std(1, keepdims=True) + 1e-6) / math.sqrt(z.shape[1])
+    return np.stack(desc), np.asarray(mag), z
 
 
-def transition_score(frames, mad, s, e, k):
-    clip = frames[s:e].astype(np.float32)/255
-    head, tail = clip[:k], clip[-k:]
-    a = np.linspace(0,1,k,np.float32)[:,None,None]
-    blend = (1-a)*tail + a*head
-    ds = [np.mean(np.abs(clip[len(clip)-k-1]-blend[0]))]
-    ds += np.mean(np.abs(blend[1:]-blend[:-1]), axis=(1,2)).tolist()
-    ds += [np.mean(np.abs(blend[-1]-clip[k]))]
-    med = float(np.median(mad[s:e-1])) + 1e-9
-    r = np.asarray(ds)/med
-    natural = math.exp(-float(np.mean(np.abs(np.log(np.clip(r,1e-4,None))))))
-    return natural, float(r.min()), float(r.max())
+def choose_fallback(frames, fps, transition_choices, args):
+    n, look = len(frames), 3
+    min_span = round(n * args.min_duration_ratio)
+    max_span = min(n - look - 1, round(n * args.max_duration_ratio))
+    if min_span >= max_span:
+        raise RuntimeError("Duration constraints leave no fallback search interval")
 
-
-def choose(frames, fps, min_ratio, max_ratio, transition, shortlist):
-    n, k, look = len(frames), max(2, round(transition*fps)), 3
-    lo = max(2*k+12, round(n*min_ratio)); hi = min(n-look-1, round(n*max_ratio))
-    if lo >= hi:
-        raise RuntimeError("Duration constraints leave no search interval")
-    desc, mag, mad, z = features(frames)
+    frame_diffs = base_frame_diffs(frames)
+    desc, mag, z = fallback_features(frames)
     heap = []
-    for s in range(n-lo):
-        for e in range(s+lo, min(s+hi, n-look-1)+1):
+    max_k = max(k for k, _ in transition_choices)
+    min_span = max(min_span, 2 * max_k + 12)
+
+    for s in range(n - min_span):
+        for e in range(s + min_span, min(s + max_span, n - look - 1) + 1):
             corr = float(z[s] @ z[e])
-            fs = float(np.mean(np.sum(desc[s:s+look]*desc[e:e+look], axis=1)))
-            seg, med = mag[s:e], float(np.median(mag[s:e]))+1e-8
-            seam = np.r_[mag[s:s+look], mag[e:e+look]]
-            motion = float(np.clip(np.mean(np.minimum(seam/med, med/(seam+1e-8))),0,1))
-            low = float(np.mean(seg < .6*med))
-            q = .55*(corr+1)/2 + .25*(fs+1)/2 + .15*motion + .05*(1-low)
-            item = (q,s,e,corr,fs,motion)
-            if len(heap) < shortlist: heapq.heappush(heap,item)
-            elif q > heap[0][0]: heapq.heapreplace(heap,item)
-    best, top = None, []
-    target = max(.1, n/fps*.87)
-    for _,s,e,corr,fs,motion in sorted(heap, reverse=True):
-        ss = ssim(frames[s],frames[e]); nat,rmin,rmax = transition_score(frames,mad,s,e,k)
-        dur = (e-s-k)/fps
-        worst = math.exp(-.5*max(abs(math.log(max(rmin,1e-4))),abs(math.log(max(rmax,1e-4)))))
-        score = .34*ss + .23*(fs+1)/2 + .27*nat + .08*worst + .08*min(1,dur/target)
-        x = {"start_frame":s,"end_frame":e,"transition_frames":k,"score":score,"ssim":ss,
-             "flow_similarity":fs,"transition_naturalness":nat,"transition_min_ratio":rmin,
-             "transition_max_ratio":rmax,"output_duration":dur,"fast_correlation":corr,
-             "boundary_motion_level":motion}
-        top.append(x)
-        if best is None or score > best["score"]: best = x
-    top.sort(key=lambda x:x["score"], reverse=True)
-    return best, top[:10]
+            flow_similarity = float(np.mean(np.sum(desc[s:s + look] * desc[e:e + look], axis=1)))
+            segment = mag[s:e]
+            med = float(np.median(segment)) + 1e-8
+            seam = np.r_[mag[s:s + look], mag[e:e + look]]
+            motion = float(np.clip(np.mean(np.minimum(seam / med, med / (seam + 1e-8))), 0, 1))
+            low = float(np.mean(segment < .6 * med))
+            quick = .55 * (corr + 1) / 2 + .25 * (flow_similarity + 1) / 2 + .15 * motion + .05 * (1 - low)
+            item = (quick, s, e, corr, flow_similarity, motion)
+            if len(heap) < args.shortlist:
+                heapq.heappush(heap, item)
+            elif quick > heap[0][0]:
+                heapq.heapreplace(heap, item)
+
+    best = None
+    for _, s, e, corr, flow_similarity, motion in sorted(heap, reverse=True):
+        for k, _ in transition_choices:
+            x = candidate(frames, frame_diffs, fps, s, e, k, "fallback")
+            if not x:
+                continue
+            static_similarity = ssim(frames[s], frames[e])
+            duration_score = min(1.0, x["output_duration"] / max(.1, n / fps * .90))
+            x.update({
+                "ssim": static_similarity,
+                "flow_similarity": flow_similarity,
+                "fast_correlation": corr,
+                "boundary_motion_level": motion,
+            })
+            x["score"] = (
+                .28 * static_similarity
+                + .20 * (flow_similarity + 1) / 2
+                + .24 * x["transition_naturalness"]
+                + .14 * x["seam_balance"]
+                + .14 * duration_score
+            )
+            if best is None or x["score"] > best["score"]:
+                best = x
+
+    if best is None:
+        raise RuntimeError("Could not find a fallback loop candidate")
+    return best
 
 
-def filter_graph(info, x, audio):
-    fps, s, e, k = info["fps"], x["start_frame"], x["end_frame"], x["transition_frames"]
-    L, den = e-s, max(1,k-1)
-    f = [
+def filter_graph(info, selection, audio):
+    fps = info["fps"]
+    s = selection["start_frame"]
+    e = selection["end_frame"]
+    k = selection["transition_frames"]
+    length = e - s
+    den = max(1, k - 1)
+
+    filters = [
         f"[0:v]trim=start_frame={s}:end_frame={e},setpts=N/{fps:.12f}/TB[v]",
         "[v]split=3[vh][vm][vt]",
         f"[vh]trim=start_frame=0:end_frame={k},setpts=N/{fps:.12f}/TB[head]",
-        f"[vm]trim=start_frame={k}:end_frame={L-k},setpts=N/{fps:.12f}/TB[mid]",
-        f"[vt]trim=start_frame={L-k}:end_frame={L},setpts=N/{fps:.12f}/TB[tail]",
+        f"[vm]trim=start_frame={k}:end_frame={length-k},setpts=N/{fps:.12f}/TB[mid]",
+        f"[vt]trim=start_frame={length-k}:end_frame={length},setpts=N/{fps:.12f}/TB[tail]",
         f"[tail][head]blend=all_expr='A*(1-N/{den})+B*(N/{den})':shortest=1[blend]",
         f"[mid][blend]concat=n=2:v=1:a=0,fps={fps:.12f}[outv]",
     ]
-    maps = ["-map","[outv]"]
+    maps = ["-map", "[outv]"]
+
     if audio == "crossfade" and info["has_audio"]:
-        t0, dur, fade = s/fps, L/fps, k/fps
-        f += [
-            f"[0:a:0]atrim=start={t0+fade:.12f}:end={t0+dur-fade:.12f},asetpts=PTS-STARTPTS[amid]",
-            f"[0:a:0]atrim=start={t0+dur-fade:.12f}:end={t0+dur:.12f},asetpts=PTS-STARTPTS,afade=t=out:st=0:d={fade:.12f}:curve=qsin[atail]",
+        t0 = s / fps
+        duration = length / fps
+        fade = k / fps
+        filters += [
+            f"[0:a:0]atrim=start={t0+fade:.12f}:end={t0+duration-fade:.12f},asetpts=PTS-STARTPTS[amid]",
+            f"[0:a:0]atrim=start={t0+duration-fade:.12f}:end={t0+duration:.12f},asetpts=PTS-STARTPTS,afade=t=out:st=0:d={fade:.12f}:curve=qsin[atail]",
             f"[0:a:0]atrim=start={t0:.12f}:end={t0+fade:.12f},asetpts=PTS-STARTPTS,afade=t=in:st=0:d={fade:.12f}:curve=qsin[ahead]",
             "[atail][ahead]amix=inputs=2:duration=shortest:dropout_transition=0:normalize=0,asetpts=PTS-STARTPTS[ablend]",
             "[amid][ablend]concat=n=2:v=0:a=1[outa]",
-        ]; maps += ["-map","[outa]"]
-    return ";".join(f), maps
+        ]
+        maps += ["-map", "[outa]"]
+
+    return ";".join(filters), maps
 
 
-def render(src, dst, info, x, args):
-    fg, maps = filter_graph(info,x,args.audio)
-    cmd = [args.ffmpeg,"-y","-hide_banner","-loglevel","error","-i",str(src),"-filter_complex",fg,*maps,
-           "-c:v","libx264","-preset",args.preset,"-crf",str(args.crf),"-pix_fmt","yuv420p"]
-    if args.audio == "crossfade" and info["has_audio"]: cmd += ["-c:a","aac","-b:a","192k"]
-    else: cmd += ["-an"]
-    p = run(cmd + ["-movflags","+faststart",str(dst)])
-    if p.returncode: raise RuntimeError(p.stderr)
+def render(src, dst, info, selection, args):
+    graph, maps = filter_graph(info, selection, args.audio)
+    cmd = [
+        args.ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(src),
+        "-filter_complex", graph, *maps,
+        "-c:v", "libx264", "-preset", args.preset, "-crf", str(args.crf), "-pix_fmt", "yuv420p",
+    ]
+    if args.audio == "crossfade" and info["has_audio"]:
+        cmd += ["-c:a", "aac", "-b:a", "192k"]
+    else:
+        cmd += ["-an"]
+    result = run(cmd + ["-movflags", "+faststart", str(dst)])
+    if result.returncode:
+        raise RuntimeError(result.stderr)
 
 
 def verify(path, width):
-    f,fps = read_frames(path,width); a=f.astype(np.float32)/255
-    d=np.mean(np.abs(a[1:]-a[:-1]),axis=(1,2)); b=float(np.mean(np.abs(a[-1]-a[0]))); m=float(np.median(d))+1e-9
-    return {"frames":len(f),"fps":fps,"duration":len(f)/fps,"boundary_diff":b,"internal_median_diff":m,
-            "boundary_ratio":b/m,"min_internal_diff":float(d.min()),"max_internal_diff":float(d.max())}
+    frames, fps = read_frames(path, width)
+    arr = frames.astype(np.float32) / 255
+    diffs = np.mean(np.abs(arr[1:] - arr[:-1]), axis=(1, 2))
+    boundary = float(np.mean(np.abs(arr[-1] - arr[0])))
+    median = float(np.median(diffs)) + 1e-9
+    return {
+        "frames": len(frames),
+        "fps": fps,
+        "duration": len(frames) / fps,
+        "boundary_diff": boundary,
+        "internal_median_diff": median,
+        "boundary_ratio": boundary / median,
+        "min_internal_diff": float(diffs.min()),
+        "max_internal_diff": float(diffs.max()),
+    }
 
 
 def main():
-    p=argparse.ArgumentParser(description="Automatically trim and crossfade a short video into a smoother seamless loop")
-    p.add_argument("input",type=Path); p.add_argument("output",type=Path,nargs="?")
-    p.add_argument("--audio",choices=("mute","crossfade"),default="mute")
-    p.add_argument("--transition",type=float,default=.50); p.add_argument("--min-duration-ratio",type=float,default=.75)
-    p.add_argument("--max-duration-ratio",type=float,default=.98); p.add_argument("--analysis-width",type=int,default=320)
-    p.add_argument("--shortlist",type=int,default=150); p.add_argument("--preview-repeats",type=int,default=0)
-    p.add_argument("--report",type=Path); p.add_argument("--crf",type=int,default=18); p.add_argument("--preset",default="medium")
-    p.add_argument("--ffmpeg",default="ffmpeg"); p.add_argument("--ffprobe",default="ffprobe"); a=p.parse_args()
-    if not a.input.exists(): return print("Input not found",file=sys.stderr) or 2
-    if not shutil.which(a.ffmpeg) or not shutil.which(a.ffprobe): return print("ffmpeg/ffprobe not found",file=sys.stderr) or 2
-    if not (.4 <= a.min_duration_ratio < a.max_duration_ratio <= 1): return print("Invalid duration ratios",file=sys.stderr) or 2
-    out=(a.output or a.input.with_name(a.input.stem+"_loop.mp4")).resolve(); out.parent.mkdir(parents=True,exist_ok=True)
+    parser = argparse.ArgumentParser(description="Preserve-first automatic seamless loop maker for short videos")
+    parser.add_argument("input", type=Path)
+    parser.add_argument("output", type=Path, nargs="?")
+    parser.add_argument("--audio", choices=("mute", "crossfade"), default="mute")
+    parser.add_argument("--transition", default="auto", help="'auto' (default) or transition seconds, e.g. 0.5")
+    parser.add_argument("--small-trim-ratio", type=float, default=.08, help="Maximum source frames removed before fallback search")
+    parser.add_argument("--seam-min-ratio", type=float, default=.75)
+    parser.add_argument("--seam-max-ratio", type=float, default=1.33)
+    parser.add_argument("--min-transition-naturalness", type=float, default=.80)
+    parser.add_argument("--verify-min-ratio", type=float, default=.60, help="Accepted encoded-output boundary ratio before retry")
+    parser.add_argument("--verify-max-ratio", type=float, default=1.55, help="Accepted encoded-output boundary ratio before retry")
+    parser.add_argument("--retry-seam-min-ratio", type=float, default=.90, help="Stricter simulated lower bound used only after failed output verification")
+    parser.add_argument("--retry-seam-max-ratio", type=float, default=1.15, help="Stricter simulated upper bound used only after failed output verification")
+    parser.add_argument("--min-duration-ratio", type=float, default=.75, help="Fallback search only")
+    parser.add_argument("--max-duration-ratio", type=float, default=.98, help="Fallback search only")
+    parser.add_argument("--analysis-width", type=int, default=320)
+    parser.add_argument("--shortlist", type=int, default=150)
+    parser.add_argument("--preview-repeats", type=int, default=0)
+    parser.add_argument("--report", type=Path)
+    parser.add_argument("--crf", type=int, default=18)
+    parser.add_argument("--preset", default="medium")
+    parser.add_argument("--ffmpeg", default="ffmpeg")
+    parser.add_argument("--ffprobe", default="ffprobe")
+    args = parser.parse_args()
+
+    if not args.input.exists():
+        print("Input not found", file=sys.stderr)
+        return 2
+    if not shutil.which(args.ffmpeg) or not shutil.which(args.ffprobe):
+        print("ffmpeg/ffprobe not found", file=sys.stderr)
+        return 2
+    if not (0 <= args.small_trim_ratio <= .25):
+        print("--small-trim-ratio must be between 0 and 0.25", file=sys.stderr)
+        return 2
+    if not (0 < args.seam_min_ratio < args.seam_max_ratio):
+        print("Invalid seam ratio range", file=sys.stderr)
+        return 2
+    if not (0 < args.verify_min_ratio < args.verify_max_ratio):
+        print("Invalid verification ratio range", file=sys.stderr)
+        return 2
+    if not (.4 <= args.min_duration_ratio < args.max_duration_ratio <= 1):
+        print("Invalid fallback duration ratios", file=sys.stderr)
+        return 2
+
+    out = (args.output or args.input.with_name(args.input.stem + "_loop.mp4")).resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+
     try:
-        info=probe(a.input,a.ffprobe); frames,cvfps=read_frames(a.input,a.analysis_width); info["fps"]=cvfps or info["fps"]
+        info = probe(args.input, args.ffprobe)
+        frames, cvfps = read_frames(args.input, args.analysis_width)
+        info["fps"] = cvfps or info["fps"]
+        choices = parse_transition_choices(args.transition, info["fps"])
+
         print(f"Input: {info['width']}x{info['height']}, {info['fps']:.6g} fps, {len(frames)} frames, {info['duration']:.3f} s")
-        x,top=choose(frames,info["fps"],a.min_duration_ratio,a.max_duration_ratio,a.transition,a.shortlist)
-        print(f"Selected frames {x['start_frame']}..{x['end_frame']-1}, transition {x['transition_frames']} frames, output {x['output_duration']:.3f} s")
-        render(a.input,out,info,x,a); v=verify(out,a.analysis_width)
-        preview=None
-        if a.preview_repeats>1:
-            preview=out.with_name(f"{out.stem}_preview_x{a.preview_repeats}{out.suffix}")
-            q=run([a.ffmpeg,"-y","-hide_banner","-loglevel","error","-stream_loop",str(a.preview_repeats-1),"-i",str(out),"-c","copy",str(preview)])
-            if q.returncode: raise RuntimeError(q.stderr)
-        report={"input":str(a.input.resolve()),"output":str(out),"media":info,"audio_mode":a.audio,"selection":x,"top_candidates":top,"verification":v,"preview":str(preview) if preview else None}
-        rp=(a.report or out.with_suffix(".json")); rp.write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding="utf-8")
-        print(f"Output: {out}\nBoundary / median frame-diff ratio: {v['boundary_ratio']:.3f}\nReport: {rp}")
-        if preview: print(f"Preview: {preview}")
+        selection, candidates = choose_preserve_first(frames, info["fps"], choices, args)
+        source_trim = selection["start_frame"] + (len(frames) - selection["end_frame"])
+        print(
+            f"Selected {selection['mode']}: source frames {selection['start_frame']}..{selection['end_frame']-1}, "
+            f"trim {source_trim} frame(s), transition {selection['transition_frames']} frame(s) "
+            f"({selection['transition_seconds']:.3f} s), output {selection['output_duration']:.3f} s"
+        )
+
+        def temp_path(index):
+            return out.with_name(f"{out.stem}.__candidate{index}{out.suffix}")
+
+        def is_verified(v):
+            return args.verify_min_ratio <= v["boundary_ratio"] <= args.verify_max_ratio
+
+        def actual_score(v):
+            seam = math.exp(-abs(math.log(max(v["boundary_ratio"], 1e-4))))
+            duration = min(1.0, v["duration"] / max(info["duration"], 1e-6))
+            return seam * .78 + duration * .22 + (1.0 if is_verified(v) else 0.0)
+
+        attempts = []
+        first_tmp = temp_path(1)
+        first_tmp.unlink(missing_ok=True)
+        render(args.input, first_tmp, info, selection, args)
+        first_verification = verify(first_tmp, args.analysis_width)
+        attempts.append({"selection": selection, "verification": first_verification})
+
+        chosen_tmp = first_tmp
+        final_selection = selection
+        verification = first_verification
+
+        if not is_verified(first_verification):
+            retry_args = copy.copy(args)
+            if first_verification["boundary_ratio"] > args.verify_max_ratio:
+                retry_args.seam_max_ratio = min(args.seam_max_ratio, args.retry_seam_max_ratio)
+            else:
+                retry_args.seam_min_ratio = max(args.seam_min_ratio, args.retry_seam_min_ratio)
+
+            retry_selection, retry_candidates = choose_preserve_first(frames, info["fps"], choices, retry_args)
+            retry_key = (retry_selection["start_frame"], retry_selection["end_frame"], retry_selection["transition_frames"])
+            first_key = (selection["start_frame"], selection["end_frame"], selection["transition_frames"])
+            if retry_key != first_key:
+                second_tmp = temp_path(2)
+                second_tmp.unlink(missing_ok=True)
+                render(args.input, second_tmp, info, retry_selection, args)
+                second_verification = verify(second_tmp, args.analysis_width)
+                attempts.append({"selection": retry_selection, "verification": second_verification})
+                candidates = (candidates + retry_candidates)[:20]
+
+                if actual_score(second_verification) > actual_score(first_verification):
+                    chosen_tmp = second_tmp
+                    final_selection = retry_selection
+                    verification = second_verification
+                else:
+                    second_tmp.unlink(missing_ok=True)
+
+        if out.exists():
+            out.unlink()
+        chosen_tmp.replace(out)
+        for candidate_tmp in (temp_path(1), temp_path(2)):
+            if candidate_tmp.exists() and candidate_tmp != out:
+                candidate_tmp.unlink(missing_ok=True)
+
+        selection = final_selection
+        if len(attempts) > 1:
+            print(
+                f"Post-encode verification retried {len(attempts)-1} candidate(s); "
+                f"kept {selection['mode']} with boundary ratio {verification['boundary_ratio']:.3f}"
+            )
+
+        preview = None
+        if args.preview_repeats > 1:
+            preview = out.with_name(f"{out.stem}_preview_x{args.preview_repeats}{out.suffix}")
+            q = run([
+                args.ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                "-stream_loop", str(args.preview_repeats - 1), "-i", str(out), "-c", "copy", str(preview),
+            ])
+            if q.returncode:
+                raise RuntimeError(q.stderr)
+
+        report = {
+            "input": str(args.input.resolve()),
+            "output": str(out),
+            "media": info,
+            "audio_mode": args.audio,
+            "selection": selection,
+            "top_candidates": candidates[:10],
+            "verification": verification,
+            "render_attempts": attempts,
+            "preview": str(preview) if preview else None,
+        }
+        report_path = args.report or out.with_suffix(".json")
+        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        print(f"Output: {out}")
+        print(f"Boundary / median frame-diff ratio: {verification['boundary_ratio']:.3f}")
+        print(f"Report: {report_path}")
+        if preview:
+            print(f"Preview: {preview}")
         return 0
     except Exception as ex:
-        print(ex,file=sys.stderr); return 1
+        print(ex, file=sys.stderr)
+        return 1
 
 
-if __name__ == "__main__": raise SystemExit(main())
+if __name__ == "__main__":
+    raise SystemExit(main())
