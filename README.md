@@ -26,10 +26,12 @@ This prevents a slightly higher analysis score from unnecessarily shortening an 
 - Low-motion / near-static section penalty in fallback search.
 - Post-encode verification with one automatic stricter retry when needed.
 - Frame-accurate FFmpeg trim and overlap dissolve.
-- Default output is muted.
-- Optional synchronized audio crossfade using the same trim and transition positions as video.
-- JSON report with selection, verification, and retry attempts.
+- **Audio is preserved by default** when the source has audio.
+- Audio uses the same trim and transition positions as video and is rebuilt with synchronized crossfade.
+- `--mute` removes audio explicitly.
+- JSON report with selection, verification, retry attempts, blend curves, and preview timeline data.
 - Optional repeated preview for visually checking the loop seam.
+- Optional diagnostic timeline appended below the repeated preview, including trim lengths, transition ranges, repeated source bars, loop boundaries, and a moving playhead.
 
 ## Requirements
 
@@ -65,7 +67,7 @@ input_loop.json
 
 Default behavior:
 
-- Audio: muted
+- Audio: preserved with synchronized crossfade when present
 - Transition: `auto`
 - Small-trim budget: up to 8% of source frames before fallback search
 - Fallback duration range: 75% to 98% of source
@@ -74,13 +76,22 @@ Default behavior:
 
 `auto` tries several transition lengths and selects the best motion-balanced candidate while preserving the source span first.
 
-## Keep audio with synchronized crossfade
+## Mute the output
+
+Audio is now kept by default. Use `--mute` only when a silent loop is wanted:
 
 ```powershell
+py seamless_loop.py input.mp4 output.mp4 --mute
+```
+
+For backward-compatible explicit control, this also works:
+
+```powershell
+py seamless_loop.py input.mp4 output.mp4 --audio mute
 py seamless_loop.py input.mp4 output.mp4 --audio crossfade
 ```
 
-The audio uses the same selected source range and overlap duration as the video. The loop seam is rebuilt with fades and mixing rather than a hard audio cut.
+When audio is preserved, the same selected source range and transition duration are applied to audio. The loop seam is rebuilt with `qsin` fades and mixing instead of a hard audio cut.
 
 ## Generate a repeated seam-check preview
 
@@ -88,13 +99,62 @@ The audio uses the same selected source range and overlap duration as the video.
 py seamless_loop.py input.mp4 output.mp4 --preview-repeats 3
 ```
 
-This also creates:
+This creates:
 
 ```text
 output_preview_x3.mp4
 ```
 
 A repeated preview makes the loop boundary much easier to judge because it occurs several times in succession.
+
+## Diagnostic three-loop timeline preview
+
+Use the repeated preview together with `--preview-timeline`:
+
+```powershell
+py seamless_loop.py input.mp4 output.mp4 --preview-repeats 3 --preview-timeline
+```
+
+This creates:
+
+```text
+output_preview_x3_timeline.mp4
+```
+
+If `--preview-timeline` is supplied without a repeat count, the tool automatically uses three repeats.
+
+The diagnostic panel is appended below the video and intentionally uses a taller-than-normal playback bar. It shows:
+
+- source copy 1 and 3 on the upper row and source copy 2 on the lower row
+- the **complete original source duration** for every copy as a thin line
+- the actually retained source span as a thick line
+- head and tail trimmed regions as thin source-line sections
+- four vertical output-cycle boundaries for a three-repeat preview: start, 1→2, 2→3, and 3→1
+- transition intervals and transition frame counts
+- a connector between source rows that reflects the actual video blend curve
+- an explicit wrap connector from the third repeat back to the first repeat
+- head-trim and tail-trim duration plus frame counts
+- transition start/end position within one output cycle
+- total transition seconds and frames
+- source duration / source frame count
+- output-cycle duration / output frame count
+- moving playback-position line
+- numeric current playback timestamp when the installed FFmpeg build supports `drawtext`
+
+The current rendering curves are:
+
+- Video: **linear** blend (`A * (1-alpha) + B * alpha`)
+- Audio: **qsin** fade curves
+
+Therefore the 1→2 and 2→3 video connectors are drawn as straight diagonal lines. If the video blend algorithm changes later, the diagnostic curve should change with it rather than merely being decorative.
+
+The diagnostic preview itself is still a loopable three-repeat video. The final third-repeat boundary is the same real loop seam as the other boundaries, and the panel includes an explicit 3→1 wrap indicator so the final return to the first repeat is visible.
+
+The panel height can be changed if needed:
+
+```powershell
+py seamless_loop.py input.mp4 --preview-timeline --preview-timeline-height 320
+```
 
 ## Force a specific transition length
 
@@ -154,6 +214,8 @@ Every run produces a JSON report containing information such as:
 - actual encoded loop-boundary verification ratio
 - render attempts when a stricter retry was needed
 - SSIM / optical-flow data when fallback search is used
+- video and audio blend-curve names
+- diagnostic-preview layout values when `--preview-timeline` is enabled
 
 Specify a custom report path with:
 
@@ -181,15 +243,17 @@ FFmpeg performs frame-accurate trim, separates the head/middle/tail, overlaps th
 
 Because the head and tail are overlapped, even a no-source-trim result is shorter than the source by approximately the selected transition duration. This is overlap time, not discarded source content.
 
+The video overlap currently uses a **linear alpha blend**. Preserved audio uses **qsin fades** before mixing.
+
 ## Current real-video test cases
 
 The preserve-first version was tested using the default analysis and encoding settings on three approximately 10-second, 24 fps AI background clips:
 
-- Clip 1: no source frames trimmed; 0.75-second transition; about 9.29-second output; encoded boundary ratio about 1.25.
-- Clip 2: no source frames trimmed; 0.625-second transition; about 9.50-second output; encoded boundary ratio about 1.43.
-- Earlier test clip: only 7 source frames (about 0.29 seconds) trimmed; 0.75-second transition; about 9.00-second output; encoded boundary ratio about 1.45. The older algorithm had shortened this same source to 8.625 seconds.
+- Clip 1: no source frames trimmed; 0.75-second transition; about 9.29-second output.
+- Clip 2: no source frames trimmed; 0.625-second transition; about 9.50-second output.
+- Earlier test clip: only 7 source frames (about 0.29 seconds) trimmed; 0.75-second transition; about 9.00-second output. The older algorithm had shortened this same source to 8.625 seconds.
 
-The audio-preserving path was also verified after automatic selection/retry; video and AAC audio durations matched to within the codec timebase rounding interval.
+The new default-audio path and the diagnostic timeline preview were also verified on the earlier test clip. The loop output contains AAC audio by default, and the three-repeat diagnostic preview contains both video and audio for exactly 27 seconds. A `--mute` test was also verified to contain only a video stream.
 
 ## License
 
