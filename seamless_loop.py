@@ -16,6 +16,8 @@ import cv2
 import numpy as np
 
 AUTO_TRANSITIONS = (0.25, 1 / 3, 0.375, 0.50, 0.625, 0.75)
+VIDEO_BLEND_CURVE = "linear"
+AUDIO_BLEND_CURVE = "qsin"
 
 
 def run(cmd):
@@ -352,11 +354,224 @@ def verify(path, width):
     }
 
 
+def _text(img, text, x, y, scale=.48, color=(225, 225, 225), thickness=1):
+    cv2.putText(img, text, (int(x), int(y)), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
+
+
+def _bezier_points(p0, p1, p2, count=80):
+    t = np.linspace(0.0, 1.0, count, dtype=np.float32)[:, None]
+    p0 = np.asarray(p0, dtype=np.float32)
+    p1 = np.asarray(p1, dtype=np.float32)
+    p2 = np.asarray(p2, dtype=np.float32)
+    pts = (1 - t) ** 2 * p0 + 2 * (1 - t) * t * p1 + t ** 2 * p2
+    return np.rint(pts).astype(np.int32).reshape(-1, 1, 2)
+
+
+def build_preview_timeline(panel_path, playhead_path, width, panel_height, source_frame_count, fps, selection, repeats):
+    if repeats < 2:
+        raise ValueError("Timeline preview needs at least 2 repeats")
+
+    n = source_frame_count
+    s = selection["start_frame"]
+    e = selection["end_frame"]
+    k = selection["transition_frames"]
+    source_duration = n / fps
+    transition = k / fps
+    output_duration = (e - s - k) / fps
+    total_preview = output_duration * repeats
+    head_trim = s / fps
+    tail_trim = (n - e) / fps
+
+    panel = np.full((panel_height, width, 3), 18, np.uint8)
+    plot_left = max(18, round(width * .018))
+    plot_right = width - plot_left
+    earliest = -(s + k) / fps
+    latest = (repeats - 1) * output_duration - (s + k) / fps + source_duration
+    span = max(.001, latest - earliest)
+
+    def px(t):
+        return int(round(plot_left + (t - earliest) / span * (plot_right - plot_left)))
+
+    y_top = 60
+    y_bottom = 135 if panel_height >= 230 else max(105, panel_height // 2 + 15)
+    ys = [y_top if i % 2 == 0 else y_bottom for i in range(repeats)]
+
+    for boundary_index in range(1, repeats + 1):
+        a = px(boundary_index * output_duration - transition)
+        b = px(boundary_index * output_duration)
+        if b > 0 and a < width:
+            cv2.rectangle(panel, (max(0, a), 28), (min(width - 1, b), min(panel_height - 62, 170)), (34, 34, 34), -1)
+
+    for i in range(repeats + 1):
+        x = px(i * output_duration)
+        cv2.line(panel, (x, 22), (x, min(panel_height - 58, 175)), (165, 165, 165), 1, cv2.LINE_AA)
+        if i == 0:
+            label = "0 / START"
+        elif i == repeats:
+            label = f"{i} / LOOP"
+        else:
+            label = f"{i}|{i+1}"
+        tw = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, .43, 1)[0][0]
+        label_x = min(width - tw - 2, max(2, x - tw // 2))
+        _text(panel, label, label_x, 17, .43, (205, 205, 205))
+
+    for i in range(repeats):
+        y = ys[i]
+        anchor = i * output_duration - (s + k) / fps
+        full_start = px(anchor)
+        full_end = px(anchor + source_duration)
+        kept_start = px(anchor + s / fps)
+        kept_end = px(anchor + e / fps)
+
+        cv2.line(panel, (full_start, y), (full_end, y), (95, 95, 95), 2, cv2.LINE_AA)
+        cv2.line(panel, (kept_start, y), (kept_end, y), (232, 232, 232), 10, cv2.LINE_AA)
+        cv2.circle(panel, (full_start, y), 2, (120, 120, 120), -1, cv2.LINE_AA)
+        cv2.circle(panel, (full_end, y), 2, (120, 120, 120), -1, cv2.LINE_AA)
+        _text(panel, f"SRC {i+1}", max(2, full_start + 4), y - 15, .44, (195, 195, 195))
+
+        trans_start = px((i + 1) * output_duration - transition)
+        trans_end = px((i + 1) * output_duration)
+        cv2.line(panel, (trans_start, y), (trans_end, y), (210, 210, 210), 14, cv2.LINE_AA)
+
+    for i in range(repeats - 1):
+        boundary = (i + 1) * output_duration
+        x0 = px(boundary - transition)
+        x1 = px(boundary)
+        cv2.line(panel, (x0, ys[i]), (x1, ys[i + 1]), (245, 245, 245), 2, cv2.LINE_AA)
+        _text(panel, f"{i+1}->{i+2} {k}f", x0 + 3, min(ys[i], ys[i + 1]) - 24, .38, (195, 195, 195))
+
+    x_last = px(total_preview)
+    x_first = px(0.0)
+    wrap_y = panel_height - 40
+    p0 = (x_last, ys[-1] + 10)
+    p1 = ((x_last + x_first) // 2, wrap_y)
+    p2 = (x_first, ys[0] + 10)
+    cv2.polylines(panel, [_bezier_points(p0, p1, p2)], False, (135, 135, 135), 1, cv2.LINE_AA)
+    _text(panel, f"{repeats}->1 loop", (x_first + x_last) // 2 - 38, wrap_y - 3, .40, (160, 160, 160))
+
+    detail_y = min(panel_height - 47, 184)
+    line1 = f"Head trim: {head_trim:.3f}s / {s}f    Tail trim: {tail_trim:.3f}s / {n-e}f"
+    trans_start_out = max(0.0, output_duration - transition)
+    line2 = (
+        f"Transition: {trans_start_out:.3f}s -> {output_duration:.3f}s    "
+        f"{k}f / {transition:.3f}s    Video: {VIDEO_BLEND_CURVE}    Audio: {AUDIO_BLEND_CURVE}"
+    )
+    line3 = f"Source: {source_duration:.3f}s / {n}f    Output cycle: {output_duration:.3f}s / {e-s-k}f"
+    _text(panel, line1, 20, detail_y, .43, (220, 220, 220))
+    _text(panel, line2, 20, detail_y + 20, .43, (220, 220, 220))
+    if detail_y + 40 < panel_height - 5:
+        _text(panel, line3, 20, detail_y + 40, .43, (185, 185, 185))
+
+    if not cv2.imwrite(str(panel_path), panel):
+        raise RuntimeError(f"Could not write timeline panel: {panel_path}")
+
+    ph = np.zeros((panel_height, 7, 4), np.uint8)
+    ph[:, 2:5, :3] = (255, 255, 255)
+    ph[:, 2:5, 3] = 210
+    cv2.circle(ph, (3, 26), 3, (255, 255, 255, 235), -1, cv2.LINE_AA)
+    if not cv2.imwrite(str(playhead_path), ph):
+        raise RuntimeError(f"Could not write playhead image: {playhead_path}")
+
+    return {
+        "panel_height": panel_height,
+        "plot_time_min": earliest,
+        "plot_time_max": latest,
+        "boundary_start_x": px(0.0),
+        "boundary_end_x": px(total_preview),
+        "source_duration": source_duration,
+        "output_cycle_duration": output_duration,
+        "preview_duration": total_preview,
+        "head_trim_seconds": head_trim,
+        "head_trim_frames": s,
+        "tail_trim_seconds": tail_trim,
+        "tail_trim_frames": n - e,
+        "transition_start_in_cycle": trans_start_out,
+        "transition_end_in_cycle": output_duration,
+        "transition_seconds": transition,
+        "transition_frames": k,
+        "video_blend_curve": VIDEO_BLEND_CURVE,
+        "audio_blend_curve": AUDIO_BLEND_CURVE,
+    }
+
+
+def render_preview_plain(out, preview, repeats, args):
+    q = run([
+        args.ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+        "-stream_loop", str(repeats - 1), "-i", str(out), "-c", "copy", str(preview),
+    ])
+    if q.returncode:
+        raise RuntimeError(q.stderr)
+
+
+def render_preview_timeline(out, preview, info, selection, verification, source_frame_count, repeats, args):
+    panel_height = max(180, args.preview_timeline_height)
+    panel_path = preview.with_name(preview.stem + ".__timeline.png")
+    playhead_path = preview.with_name(preview.stem + ".__playhead.png")
+    timeline = build_preview_timeline(
+        panel_path, playhead_path, info["width"], panel_height,
+        source_frame_count, info["fps"], selection, repeats,
+    )
+
+    video_h = info["height"]
+    x0 = timeline["boundary_start_x"]
+    x1 = timeline["boundary_end_x"]
+    total = timeline["preview_duration"]
+    playhead_expr = f"{x0}+(t/{total:.12f})*({x1-x0})-3"
+
+    base_graph = (
+        f"[0:v]pad=iw:ih+{panel_height}:0:0:color=black[base];"
+        f"[base][1:v]overlay=0:{video_h}:shortest=1[p];"
+        f"[p][2:v]overlay=x='{playhead_expr}':y={video_h}:eval=frame:shortest=1[ph]"
+    )
+    draw = (
+        f"[ph]drawtext=text='Play %{{pts\\:hms}} / {total:.3f}s':"
+        f"x=w-tw-18:y={video_h + panel_height - 20}:fontsize=17:fontcolor=white:"
+        f"box=1:boxcolor=black@0.45[outv]"
+    )
+
+    common = [
+        args.ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+        "-stream_loop", str(repeats - 1), "-i", str(out),
+        "-loop", "1", "-i", str(panel_path),
+        "-loop", "1", "-i", str(playhead_path),
+    ]
+
+    def execute(graph):
+        cmd = [*common, "-filter_complex", graph, "-map", "[outv]"]
+        has_audio = info["has_audio"] and args.audio == "crossfade"
+        if has_audio:
+            cmd += ["-map", "0:a?", "-c:a", "aac", "-b:a", "192k"]
+        else:
+            cmd += ["-an"]
+        cmd += [
+            "-t", f"{total:.12f}",
+            "-c:v", "libx264", "-preset", args.preset, "-crf", str(args.crf),
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(preview),
+        ]
+        return run(cmd)
+
+    result = execute(base_graph + ";" + draw)
+    timeline["numeric_play_position"] = True
+    if result.returncode:
+        fallback = execute(base_graph + ";[ph]null[outv]")
+        timeline["numeric_play_position"] = False
+        if fallback.returncode:
+            raise RuntimeError(fallback.stderr or result.stderr)
+
+    panel_path.unlink(missing_ok=True)
+    playhead_path.unlink(missing_ok=True)
+    return timeline
+
+
 def main():
     parser = argparse.ArgumentParser(description="Preserve-first automatic seamless loop maker for short videos")
     parser.add_argument("input", type=Path)
     parser.add_argument("output", type=Path, nargs="?")
-    parser.add_argument("--audio", choices=("mute", "crossfade"), default="mute")
+    parser.add_argument(
+        "--audio", choices=("crossfade", "mute"), default=None,
+        help="Explicit audio mode. Default: crossfade when source has audio",
+    )
+    parser.add_argument("--mute", action="store_true", help="Remove audio from output (default is to keep/crossfade audio)")
     parser.add_argument("--transition", default="auto", help="'auto' (default) or transition seconds, e.g. 0.5")
     parser.add_argument("--small-trim-ratio", type=float, default=.08, help="Maximum source frames removed before fallback search")
     parser.add_argument("--seam-min-ratio", type=float, default=.75)
@@ -371,12 +586,25 @@ def main():
     parser.add_argument("--analysis-width", type=int, default=320)
     parser.add_argument("--shortlist", type=int, default=150)
     parser.add_argument("--preview-repeats", type=int, default=0)
+    parser.add_argument(
+        "--preview-timeline", action="store_true",
+        help="Append a diagnostic source/trim/transition timeline and moving playhead to the repeated preview",
+    )
+    parser.add_argument("--preview-timeline-height", type=int, default=260, help="Diagnostic timeline height in pixels")
     parser.add_argument("--report", type=Path)
     parser.add_argument("--crf", type=int, default=18)
     parser.add_argument("--preset", default="medium")
     parser.add_argument("--ffmpeg", default="ffmpeg")
     parser.add_argument("--ffprobe", default="ffprobe")
     args = parser.parse_args()
+
+    if args.mute:
+        args.audio = "mute"
+    elif args.audio is None:
+        args.audio = "crossfade"
+
+    if args.preview_timeline and args.preview_repeats <= 1:
+        args.preview_repeats = 3
 
     if not args.input.exists():
         print("Input not found", file=sys.stderr)
@@ -396,6 +624,9 @@ def main():
     if not (.4 <= args.min_duration_ratio < args.max_duration_ratio <= 1):
         print("Invalid fallback duration ratios", file=sys.stderr)
         return 2
+    if args.preview_repeats < 0:
+        print("--preview-repeats must be >= 0", file=sys.stderr)
+        return 2
 
     out = (args.output or args.input.with_name(args.input.stem + "_loop.mp4")).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -407,6 +638,7 @@ def main():
         choices = parse_transition_choices(args.transition, info["fps"])
 
         print(f"Input: {info['width']}x{info['height']}, {info['fps']:.6g} fps, {len(frames)} frames, {info['duration']:.3f} s")
+        print(f"Audio: {'mute' if args.audio == 'mute' else ('crossfade' if info['has_audio'] else 'source has no audio')}")
         selection, candidates = choose_preserve_first(frames, info["fps"], choices, args)
         source_trim = selection["start_frame"] + (len(frames) - selection["end_frame"])
         print(
@@ -477,25 +709,32 @@ def main():
             )
 
         preview = None
+        preview_timeline = None
         if args.preview_repeats > 1:
-            preview = out.with_name(f"{out.stem}_preview_x{args.preview_repeats}{out.suffix}")
-            q = run([
-                args.ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-                "-stream_loop", str(args.preview_repeats - 1), "-i", str(out), "-c", "copy", str(preview),
-            ])
-            if q.returncode:
-                raise RuntimeError(q.stderr)
+            suffix = f"_preview_x{args.preview_repeats}"
+            if args.preview_timeline:
+                suffix += "_timeline"
+            preview = out.with_name(f"{out.stem}{suffix}{out.suffix}")
+            if args.preview_timeline:
+                preview_timeline = render_preview_timeline(
+                    out, preview, info, selection, verification, len(frames), args.preview_repeats, args,
+                )
+            else:
+                render_preview_plain(out, preview, args.preview_repeats, args)
 
         report = {
             "input": str(args.input.resolve()),
             "output": str(out),
             "media": info,
             "audio_mode": args.audio,
+            "video_blend_curve": VIDEO_BLEND_CURVE,
+            "audio_blend_curve": AUDIO_BLEND_CURVE if args.audio == "crossfade" and info["has_audio"] else None,
             "selection": selection,
             "top_candidates": candidates[:10],
             "verification": verification,
             "render_attempts": attempts,
             "preview": str(preview) if preview else None,
+            "preview_timeline": preview_timeline,
         }
         report_path = args.report or out.with_suffix(".json")
         report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
